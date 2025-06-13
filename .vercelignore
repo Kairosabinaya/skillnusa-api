@@ -1,0 +1,12 @@
+# Ignore everything
+*
+
+# Don't ignore config directory
+!config/
+!config/*
+
+# Don't ignore source files
+!src/
+!src/**
+!package.json
+!next.config.js 

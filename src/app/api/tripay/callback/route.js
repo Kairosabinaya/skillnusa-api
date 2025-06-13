@@ -41,23 +41,47 @@ export async function POST(request) {
     const ordersRef = db.collection('orders');
     const querySnapshot = await ordersRef.where('merchantRef', '==', merchant_ref).get();
     
+    let orderDoc, orderId, orderData;
+    
     if (querySnapshot.empty) {
-      console.error(`❌ [Tripay Callback] Order not found for merchant_ref: ${merchant_ref}`);
-      return NextResponse.json(
-        { success: false, message: 'Order not found' },
-        { status: 404 }
-      );
+      console.warn(`⚠️ [Tripay Callback] Order not found for merchant_ref: ${merchant_ref}, creating missing order`);
+      
+      // Auto-create missing order with minimal required data
+      const newOrderData = {
+        merchantRef: merchant_ref,
+        tripayReference: reference,
+        status: 'payment',
+        paymentStatus: 'pending',
+        totalAmount: callbackData.total_amount || 0,
+        amountReceived: callbackData.amount_received || 0,
+        paymentMethod: callbackData.payment_method || 'Unknown',
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+        autoCreated: true,
+        note: 'Auto-created from callback due to missing order'
+      };
+      
+      // Create the missing order
+      const newOrderRef = await ordersRef.add(newOrderData);
+      orderId = newOrderRef.id;
+      orderData = newOrderData;
+      
+      console.log('✅ [Tripay Callback] Created missing order:', {
+        orderId,
+        merchantRef: merchant_ref,
+        totalAmount: callbackData.total_amount
+      });
+    } else {
+      orderDoc = querySnapshot.docs[0];
+      orderId = orderDoc.id;
+      orderData = orderDoc.data();
+      
+      console.log('📋 [Tripay Callback] Found existing order:', {
+        orderId,
+        currentStatus: orderData.status,
+        newStatus: status
+      });
     }
-    
-    const orderDoc = querySnapshot.docs[0];
-    const orderId = orderDoc.id;
-    const orderData = orderDoc.data();
-    
-    console.log('📋 [Tripay Callback] Found order:', {
-      orderId,
-      currentStatus: orderData.status,
-      newStatus: status
-    });
     
     // Determine new order status based on Tripay status
     let newOrderStatus = orderData.status;

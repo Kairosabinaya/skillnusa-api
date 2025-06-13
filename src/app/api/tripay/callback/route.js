@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
-import { db } from '../../../../firebase/config';
-import { doc, updateDoc, getDoc, serverTimestamp, collection, query, where, getDocs } from 'firebase/firestore';
+import { db } from '../../../../firebase/admin';
+import { FieldValue } from 'firebase-admin/firestore';
 
 export async function POST(request) {
   try {
@@ -37,10 +37,9 @@ export async function POST(request) {
       payment_method
     });
     
-    // Find order by merchant reference
-    const ordersRef = collection(db, 'orders');
-    const q = query(ordersRef, where('merchantRef', '==', merchant_ref));
-    const querySnapshot = await getDocs(q);
+    // Find order by merchant reference using Firebase Admin SDK
+    const ordersRef = db.collection('orders');
+    const querySnapshot = await ordersRef.where('merchantRef', '==', merchant_ref).get();
     
     if (querySnapshot.empty) {
       console.error(`❌ [Tripay Callback] Order not found for merchant_ref: ${merchant_ref}`);
@@ -86,18 +85,18 @@ export async function POST(request) {
         break;
     }
     
-    // Prepare update data
+    // Prepare update data using Firebase Admin SDK
     const updateData = {
       paymentStatus,
       tripayStatus: status,
       tripayReference: reference,
-      updatedAt: serverTimestamp()
+      updatedAt: FieldValue.serverTimestamp()
     };
     
     // Add payment completion data if paid
     if (status.toUpperCase() === 'PAID') {
       updateData.status = newOrderStatus;
-      updateData.paidAt = paid_at ? new Date(paid_at * 1000) : serverTimestamp();
+      updateData.paidAt = paid_at ? new Date(paid_at * 1000) : FieldValue.serverTimestamp();
       
       // Set confirmation deadline (3 hours from payment)
       const confirmationDeadline = new Date();
@@ -112,25 +111,25 @@ export async function POST(request) {
         updateData.paymentMethod = payment_method;
       }
       
-      // Update timeline
-      updateData['timeline.confirmed'] = serverTimestamp();
+      // Update timeline using nested field update
+      updateData['timeline.confirmed'] = FieldValue.serverTimestamp();
       
       console.log('💰 [Tripay Callback] Payment confirmed - updating to pending status');
     } else if (['EXPIRED', 'FAILED', 'REFUND'].includes(status.toUpperCase())) {
       updateData.status = newOrderStatus;
-      updateData.cancelledAt = serverTimestamp();
+      updateData.cancelledAt = FieldValue.serverTimestamp();
       updateData.cancellationReason = `Payment ${status.toLowerCase()}`;
       
-      // Update timeline
-      updateData['timeline.cancelled'] = serverTimestamp();
+      // Update timeline using nested field update
+      updateData['timeline.cancelled'] = FieldValue.serverTimestamp();
       
       console.log(`❌ [Tripay Callback] Payment ${status} - updating to cancelled status`);
     }
     
-    // Update order in Firebase
+    // Update order in Firebase using Admin SDK
     console.log('🔄 [Tripay Callback] Updating order with data:', updateData);
-    const orderRef = doc(db, 'orders', orderId);
-    await updateDoc(orderRef, updateData);
+    const orderRef = db.collection('orders').doc(orderId);
+    await orderRef.update(updateData);
     
     console.log('✅ [Tripay Callback] Order updated successfully:', {
       orderId,

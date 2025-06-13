@@ -6,7 +6,7 @@ export async function POST(request) {
   try {
     console.log('💰 [Refund API] Processing refund request');
     
-    const { orderId, reason, refundType = 'auto', requestedBy } = await request.json();
+    const { orderId, reason, refundType = 'auto', requestedBy, bankAccountId } = await request.json();
     
     // Validate required fields
     if (!orderId) {
@@ -28,6 +28,25 @@ export async function POST(request) {
     }
 
     const orderData = orderDoc.data();
+    
+    // Get bank account if provided
+    let bankAccountData = null;
+    if (bankAccountId) {
+      const bankAccountRef = db.collection('bankAccounts').doc(bankAccountId);
+      const bankAccountDoc = await bankAccountRef.get();
+      
+      if (bankAccountDoc.exists) {
+        bankAccountData = bankAccountDoc.data();
+        
+        // Verify bank account belongs to client
+        if (bankAccountData.userId !== orderData.clientId) {
+          return NextResponse.json(
+            { success: false, message: 'Bank account does not belong to client' },
+            { status: 403 }
+          );
+        }
+      }
+    }
     
     // Validate order can be refunded
     const validationResult = validateRefundEligibility(orderData);
@@ -61,6 +80,13 @@ export async function POST(request) {
       refundType, // 'auto' or 'manual'
       requestedBy: requestedBy || 'system',
       status: 'pending',
+      // Bank account information for refund
+      bankAccount: bankAccountData ? {
+        bankAccountId,
+        bankName: bankAccountData.bankName,
+        accountNumber: bankAccountData.accountNumber,
+        accountHolderName: bankAccountData.accountHolderName
+      } : null,
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp()
     };

@@ -108,6 +108,37 @@ export async function POST(request) {
             'timeline.refundInitiatedAt': now
           });
 
+          // Trigger automatic refund for paid orders
+          if (orderData.paymentStatus === 'paid') {
+            try {
+              console.log(`💰 [TimeoutChecker] Triggering auto refund for order: ${orderId}`);
+              
+              // Call refund API
+              const refundResponse = await fetch(`${process.env.VERCEL_URL || 'http://localhost:3000'}/api/refund`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  orderId: orderId,
+                  reason: 'Freelancer confirmation timeout (3 hours)',
+                  refundType: 'auto',
+                  requestedBy: 'system'
+                })
+              });
+
+              if (refundResponse.ok) {
+                const refundResult = await refundResponse.json();
+                console.log(`✅ [TimeoutChecker] Auto refund initiated for order: ${orderId}`, refundResult);
+              } else {
+                console.error(`❌ [TimeoutChecker] Auto refund failed for order: ${orderId}`, await refundResponse.text());
+              }
+            } catch (refundError) {
+              console.error(`❌ [TimeoutChecker] Error triggering auto refund for order ${orderId}:`, refundError);
+              // Don't fail the timeout process if refund fails
+            }
+          }
+
           // Create notification for client
           await createNotification(orderData.clientId, {
             type: 'order',

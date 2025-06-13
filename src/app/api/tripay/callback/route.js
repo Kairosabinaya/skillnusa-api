@@ -122,9 +122,9 @@ export async function POST(request) {
       updateData.status = newOrderStatus;
       updateData.paidAt = paid_at ? new Date(paid_at * 1000) : FieldValue.serverTimestamp();
       
-      // Set confirmation deadline (3 hours from payment)
+      // Set confirmation deadline (1 minute from payment - FOR TESTING)
       const confirmationDeadline = new Date();
-      confirmationDeadline.setHours(confirmationDeadline.getHours() + 3);
+      confirmationDeadline.setMinutes(confirmationDeadline.getMinutes() + 1);
       updateData.confirmationDeadline = confirmationDeadline;
       
       if (amount_received) {
@@ -163,10 +163,99 @@ export async function POST(request) {
       paymentStatus
     });
     
-    // TODO: Send notification to freelancer if payment is confirmed
+    // Send notification and create chat if payment is confirmed
     if (status.toUpperCase() === 'PAID') {
-      console.log('📧 [Tripay Callback] TODO: Send notification to freelancer');
-      // Implement freelancer notification here
+      console.log('📧 [Tripay Callback] Payment confirmed - creating chat and sending notifications');
+      
+      try {
+        // Import required services
+        const { db: clientDb } = await import('../../../../firebase/config');
+        const { collection, addDoc, serverTimestamp, doc, getDoc } = await import('firebase/firestore');
+        
+        // Get order details for chat creation
+        const orderDoc = await db.collection('orders').doc(orderId).get();
+        const orderData = orderDoc.data();
+        
+        if (orderData) {
+          // Create chat between client and freelancer
+          const chatData = {
+            participants: [orderData.clientId, orderData.freelancerId],
+            participantDetails: {},
+            lastMessage: '',
+            lastMessageTime: FieldValue.serverTimestamp(),
+            lastMessageSender: '',
+            orderId: orderId,
+            gigId: orderData.gigId,
+            createdAt: FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp()
+          };
+          
+          // Get participant details
+          const [clientDoc, freelancerDoc] = await Promise.all([
+            db.collection('users').doc(orderData.clientId).get(),
+            db.collection('users').doc(orderData.freelancerId).get()
+          ]);
+          
+          if (clientDoc.exists) {
+            chatData.participantDetails[orderData.clientId] = {
+              displayName: clientDoc.data().displayName || 'Client',
+              profilePhoto: clientDoc.data().profilePhoto || null
+            };
+          }
+          
+          if (freelancerDoc.exists) {
+            chatData.participantDetails[orderData.freelancerId] = {
+              displayName: freelancerDoc.data().displayName || 'Freelancer',
+              profilePhoto: freelancerDoc.data().profilePhoto || null
+            };
+          }
+          
+          // Create chat
+          const chatRef = await db.collection('chats').add(chatData);
+          console.log('✅ [Tripay Callback] Chat created:', chatRef.id);
+          
+          // Send order notification message to chat
+          const notificationContent = `🎉 Pesanan Baru Dibuat!\n\n📋 Layanan: ${orderData.title}\n📦 Paket: ${orderData.packageType || 'Dasar'}\n💰 Total: Rp ${(orderData.price || 0).toLocaleString('id-ID')}\n\n📝 Kebutuhan Client:\n"${orderData.requirements || 'Tidak ada kebutuhan khusus'}"\n\n⏰ Pesanan telah dibayar dan menunggu konfirmasi freelancer dalam 1 menit (TESTING).`;
+          
+          const messageData = {
+            chatId: chatRef.id,
+            senderId: orderData.clientId,
+            content: notificationContent,
+            messageType: 'order_notification',
+            metadata: {
+              orderId: orderId,
+              type: 'order_created'
+            },
+            isRead: false,
+            createdAt: FieldValue.serverTimestamp()
+          };
+          
+          await db.collection('messages').add(messageData);
+          
+          // Update chat with last message
+          await chatRef.update({
+            lastMessage: 'Pesanan baru dibuat',
+            lastMessageTime: FieldValue.serverTimestamp(),
+            lastMessageSender: orderData.clientId
+          });
+          
+          // Send notification to freelancer
+          await db.collection('notifications').add({
+            userId: orderData.freelancerId,
+            type: 'order',
+            title: '🎉 Pesanan Baru Masuk',
+            message: `Pesanan baru "${orderData.title}" telah dibayar dan menunggu konfirmasi Anda.`,
+            orderId: orderId,
+            createdAt: FieldValue.serverTimestamp(),
+            read: false
+          });
+          
+          console.log('✅ [Tripay Callback] Chat and notifications created successfully');
+        }
+      } catch (error) {
+        console.error('❌ [Tripay Callback] Error creating chat and notifications:', error);
+        // Don't fail the callback if chat creation fails
+      }
     }
     
     return NextResponse.json({

@@ -52,7 +52,7 @@ export async function POST(request) {
           await doc.ref.update({
             status: 'cancelled',
             paymentStatus: 'expired',
-            cancellationReason: 'Payment timeout (60 minutes)',
+            cancellationReason: 'Payment timeout (1 minute - TESTING)',
             cancelledAt: now,
             updatedAt: now,
             'timeline.cancelled': now
@@ -62,7 +62,7 @@ export async function POST(request) {
           await createNotification(orderData.clientId, {
             type: 'payment',
             title: '⏰ Pembayaran Kedaluwarsa',
-            message: `Waktu pembayaran untuk "${orderData.title}" telah habis. Pesanan dibatalkan.`,
+            message: `Waktu pembayaran untuk "${orderData.title}" telah habis (1 menit - TESTING). Pesanan dibatalkan.`,
             orderId: orderId,
             createdAt: now
           });
@@ -98,7 +98,7 @@ export async function POST(request) {
           
           await doc.ref.update({
             status: 'cancelled',
-            cancellationReason: 'Freelancer confirmation timeout (3 hours)',
+            cancellationReason: 'Freelancer confirmation timeout (1 minute - TESTING)',
             cancelledAt: now,
             updatedAt: now,
             refundStatus: 'pending',
@@ -121,7 +121,7 @@ export async function POST(request) {
                 },
                 body: JSON.stringify({
                   orderId: orderId,
-                  reason: 'Freelancer confirmation timeout (3 hours)',
+                  reason: 'Freelancer confirmation timeout (1 minute - TESTING)',
                   refundType: 'auto',
                   requestedBy: 'system'
                 })
@@ -143,7 +143,7 @@ export async function POST(request) {
           await createNotification(orderData.clientId, {
             type: 'order',
             title: '⏰ Pesanan Dibatalkan',
-            message: `Pesanan "${orderData.title}" dibatalkan karena freelancer tidak merespons dalam 3 jam. Refund akan diproses.`,
+            message: `Pesanan "${orderData.title}" dibatalkan karena freelancer tidak merespons dalam 1 menit (TESTING). Refund akan diproses.`,
             orderId: orderId,
             createdAt: now
           });
@@ -152,7 +152,7 @@ export async function POST(request) {
           await createNotification(orderData.freelancerId, {
             type: 'order',
             title: '⏰ Pesanan Kedaluwarsa',
-            message: `Pesanan "${orderData.title}" dibatalkan karena tidak dikonfirmasi dalam 3 jam.`,
+            message: `Pesanan "${orderData.title}" dibatalkan karena tidak dikonfirmasi dalam 1 menit (TESTING).`,
             orderId: orderId,
             createdAt: now
           });

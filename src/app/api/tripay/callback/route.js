@@ -1,225 +1,179 @@
 import { NextResponse } from 'next/server';
-import { initializeApp, getApps, cert } from 'firebase-admin/app';
-import { getFirestore } from 'firebase-admin/firestore';
-
-// Initialize Firebase Admin SDK
-if (!getApps().length) {
-  const serviceAccount = {
-    projectId: process.env.FIREBASE_PROJECT_ID,
-    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-    privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n')
-  };
-
-  // Validate required fields
-  const requiredFields = ['projectId', 'clientEmail', 'privateKey'];
-  const missingFields = requiredFields.filter(field => !serviceAccount[field]);
-  
-  if (missingFields.length > 0) {
-    throw new Error(`Missing required Firebase config: ${missingFields.join(', ')}`);
-  }
-
-  initializeApp({
-    credential: cert(serviceAccount),
-    databaseURL: `https://${serviceAccount.projectId}.firebaseio.com`
-  });
-}
-
-const db = getFirestore();
+import { db } from '../../../../firebase/config';
+import { doc, updateDoc, getDoc, serverTimestamp, collection, query, where, getDocs } from 'firebase/firestore';
 
 export async function POST(request) {
   try {
-    // Validate request secret
-    const callbackSecret = request.headers.get('X-Callback-Secret');
-    const expectedSecret = process.env.NEXTJS_API_SECRET;
+    console.log('🔔 [Tripay Callback] Received callback request');
     
-    if (!expectedSecret) {
-      console.error('NEXTJS_API_SECRET not configured');
-      return NextResponse.json(
-        { error: 'Server configuration error' },
-        { status: 500 }
-      );
+    // Enhanced request logging
+    const headers = Object.fromEntries(request.headers.entries());
+    console.log('📋 [Tripay Callback] Headers:', headers);
+    
+    // Get callback data
+    const callbackData = await request.json();
+    console.log('📥 [Tripay Callback] Data:', callbackData);
+    
+    // Validate required fields
+    const requiredFields = ['reference', 'merchant_ref', 'status'];
+    for (const field of requiredFields) {
+      if (!callbackData[field]) {
+        console.error(`❌ [Tripay Callback] Missing field: ${field}`);
+        return NextResponse.json(
+          { success: false, message: `Missing required field: ${field}` },
+          { status: 400 }
+        );
+      }
     }
     
-    if (!callbackSecret || callbackSecret !== expectedSecret) {
-      return NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401 }
-      );
-    }
-
-    const body = await request.json();
-    const { tripay_callback, validated, timestamp } = body;
-
-    // Validate payload structure
-    if (!tripay_callback || !validated) {
-      return NextResponse.json(
-        { error: 'Invalid payload structure' },
-        { status: 400 }
-      );
-    }
-
-    // Extract data using correct Tripay callback field names
-    const {
+    const { merchant_ref, status, reference, paid_at, amount_received, payment_method } = callbackData;
+    
+    console.log('🔍 [Tripay Callback] Processing:', {
       merchant_ref,
       status,
+      reference,
       paid_at,
-      total_amount,
-      reference
-    } = tripay_callback;
-
-    // Extract order ID from merchant reference (SKILLNUSA-{timestamp})
-    const orderTimestamp = merchant_ref.replace('SKILLNUSA-', '');
+      amount_received,
+      payment_method
+    });
     
     // Find order by merchant reference
-    const ordersRef = db.collection('orders');
-    const querySnapshot = await ordersRef
-      .where('merchantRef', '==', merchant_ref)
-      .limit(1)
-      .get();
-
+    const ordersRef = collection(db, 'orders');
+    const q = query(ordersRef, where('merchantRef', '==', merchant_ref));
+    const querySnapshot = await getDocs(q);
+    
     if (querySnapshot.empty) {
-      console.error('Order not found for merchant_ref:', merchant_ref);
+      console.error(`❌ [Tripay Callback] Order not found for merchant_ref: ${merchant_ref}`);
       return NextResponse.json(
-        { error: 'Order not found' },
+        { success: false, message: 'Order not found' },
         { status: 404 }
       );
     }
-
+    
     const orderDoc = querySnapshot.docs[0];
     const orderId = orderDoc.id;
     const orderData = orderDoc.data();
-
-    // Determine new order status based on payment status
-    let newStatus = orderData.status;
+    
+    console.log('📋 [Tripay Callback] Found order:', {
+      orderId,
+      currentStatus: orderData.status,
+      newStatus: status
+    });
+    
+    // Determine new order status based on Tripay status
+    let newOrderStatus = orderData.status;
     let paymentStatus = 'pending';
-
-    switch (status) {
+    
+    switch (status.toUpperCase()) {
       case 'PAID':
-        newStatus = 'pending'; // Move to pending after payment
+        newOrderStatus = 'pending'; // Move to pending for freelancer confirmation
         paymentStatus = 'paid';
         break;
       case 'EXPIRED':
+        newOrderStatus = 'cancelled';
+        paymentStatus = 'expired';
+        break;
       case 'FAILED':
-      case 'CANCELLED':
-        newStatus = 'cancelled';
+        newOrderStatus = 'cancelled';
         paymentStatus = 'failed';
         break;
-      case 'UNPAID':
-        // Keep current status
-        paymentStatus = 'pending';
+      case 'REFUND':
+        newOrderStatus = 'cancelled';
+        paymentStatus = 'refunded';
         break;
       default:
-        console.warn('Unknown payment status:', status);
+        paymentStatus = 'pending';
         break;
     }
-
-    // Update order in Firebase
+    
+    // Prepare update data
     const updateData = {
       paymentStatus,
+      tripayStatus: status,
       tripayReference: reference,
-      paidAt: paid_at ? new Date(paid_at * 1000) : null,
-      paidAmount: total_amount,
-      updatedAt: new Date(),
+      updatedAt: serverTimestamp()
     };
-
-    // Only update status if it changes
-    if (newStatus !== orderData.status) {
-      updateData.status = newStatus;
+    
+    // Add payment completion data if paid
+    if (status.toUpperCase() === 'PAID') {
+      updateData.status = newOrderStatus;
+      updateData.paidAt = paid_at ? new Date(paid_at * 1000) : serverTimestamp();
       
-      // Update timeline based on new status
-      if (newStatus === 'pending') {
-        updateData['timeline.paidAt'] = new Date();
-        // Set 3-hour timeout for freelancer confirmation
-        const confirmationDeadline = new Date();
-        confirmationDeadline.setHours(confirmationDeadline.getHours() + 3);
-        updateData.confirmationDeadline = confirmationDeadline;
-      } else if (newStatus === 'cancelled') {
-        updateData['timeline.cancelledAt'] = new Date();
-        updateData.cancellationReason = `Payment ${status.toLowerCase()}`;
+      // Set confirmation deadline (3 hours from payment)
+      const confirmationDeadline = new Date();
+      confirmationDeadline.setHours(confirmationDeadline.getHours() + 3);
+      updateData.confirmationDeadline = confirmationDeadline;
+      
+      if (amount_received) {
+        updateData.amountReceived = amount_received;
       }
+      
+      if (payment_method) {
+        updateData.paymentMethod = payment_method;
+      }
+      
+      // Update timeline
+      updateData['timeline.confirmed'] = serverTimestamp();
+      
+      console.log('💰 [Tripay Callback] Payment confirmed - updating to pending status');
+    } else if (['EXPIRED', 'FAILED', 'REFUND'].includes(status.toUpperCase())) {
+      updateData.status = newOrderStatus;
+      updateData.cancelledAt = serverTimestamp();
+      updateData.cancellationReason = `Payment ${status.toLowerCase()}`;
+      
+      // Update timeline
+      updateData['timeline.cancelled'] = serverTimestamp();
+      
+      console.log(`❌ [Tripay Callback] Payment ${status} - updating to cancelled status`);
     }
-
-    await orderDoc.ref.update(updateData);
-
-    // Create notification for user
-    await createNotification(orderData.clientId, {
-      type: 'payment',
-      title: getNotificationTitle(status),
-      message: getNotificationMessage(status, orderData.title),
-      orderId: orderId,
-      createdAt: new Date()
+    
+    // Update order in Firebase
+    console.log('🔄 [Tripay Callback] Updating order with data:', updateData);
+    const orderRef = doc(db, 'orders', orderId);
+    await updateDoc(orderRef, updateData);
+    
+    console.log('✅ [Tripay Callback] Order updated successfully:', {
+      orderId,
+      merchantRef: merchant_ref,
+      oldStatus: orderData.status,
+      newStatus: newOrderStatus,
+      paymentStatus
     });
-
-    // If payment successful, also notify freelancer
-    if (status === 'PAID') {
-      await createNotification(orderData.freelancerId, {
-        type: 'order',
-        title: 'Pesanan Baru Masuk!',
-        message: `Anda mendapat pesanan baru: ${orderData.title}. Konfirmasi dalam 3 jam.`,
-        orderId: orderId,
-        createdAt: new Date()
-      });
+    
+    // TODO: Send notification to freelancer if payment is confirmed
+    if (status.toUpperCase() === 'PAID') {
+      console.log('📧 [Tripay Callback] TODO: Send notification to freelancer');
+      // Implement freelancer notification here
     }
-
-    console.log(`Order ${orderId} updated successfully. Status: ${newStatus}, Payment: ${paymentStatus}`);
-
+    
     return NextResponse.json({
       success: true,
       message: 'Callback processed successfully',
-      orderId: orderId,
-      newStatus: newStatus,
-      paymentStatus: paymentStatus
+      orderId,
+      merchantRef: merchant_ref,
+      status: newOrderStatus,
+      paymentStatus
     });
-
+    
   } catch (error) {
-    console.error('Error processing Tripay callback:', error);
+    console.error('❌ [Tripay Callback] Error processing callback:', error);
+    console.error('❌ [Tripay Callback] Error stack:', error.stack);
+    
     return NextResponse.json(
-      { error: 'Internal server error', details: error.message },
+      { 
+        success: false, 
+        message: 'Callback processing failed',
+        error: error.message 
+      },
       { status: 500 }
     );
   }
 }
 
-// Helper function to create notifications
-async function createNotification(userId, notificationData) {
-  try {
-    await db.collection('notifications').add({
-      userId,
-      ...notificationData,
-      isRead: false
-    });
-  } catch (error) {
-    console.error('Error creating notification:', error);
-  }
-}
-
-// Helper functions for notification messages
-function getNotificationTitle(paymentStatus) {
-  switch (paymentStatus) {
-    case 'PAID':
-      return '✅ Pembayaran Berhasil';
-    case 'EXPIRED':
-      return '⏰ Pembayaran Kedaluwarsa';
-    case 'FAILED':
-      return '❌ Pembayaran Gagal';
-    case 'CANCELLED':
-      return '🚫 Pembayaran Dibatalkan';
-    default:
-      return '💳 Update Pembayaran';
-  }
-}
-
-function getNotificationMessage(paymentStatus, orderTitle) {
-  switch (paymentStatus) {
-    case 'PAID':
-      return `Pembayaran untuk "${orderTitle}" berhasil. Menunggu konfirmasi freelancer.`;
-    case 'EXPIRED':
-      return `Waktu pembayaran untuk "${orderTitle}" telah habis. Pesanan dibatalkan.`;
-    case 'FAILED':
-      return `Pembayaran untuk "${orderTitle}" gagal diproses.`;
-    case 'CANCELLED':
-      return `Pembayaran untuk "${orderTitle}" dibatalkan.`;
-    default:
-      return `Status pembayaran untuk "${orderTitle}" diperbarui.`;
-  }
+// Handle other HTTP methods
+export async function GET() {
+  return NextResponse.json(
+    { message: 'Tripay callback endpoint - POST only' },
+    { status: 405 }
+  );
 } 

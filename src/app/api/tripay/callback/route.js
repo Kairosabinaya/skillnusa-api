@@ -127,6 +127,12 @@ export async function POST(request) {
       confirmationDeadline.setMinutes(confirmationDeadline.getMinutes() + 1);
       updateData.confirmationDeadline = confirmationDeadline;
       
+      console.log('⏰ [Tripay Callback] Setting confirmation deadline:', {
+        orderId,
+        confirmationDeadline: confirmationDeadline.toISOString(),
+        currentTime: new Date().toISOString()
+      });
+      
       if (amount_received) {
         updateData.amountReceived = amount_received;
       }

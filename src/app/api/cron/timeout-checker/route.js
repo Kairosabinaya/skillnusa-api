@@ -104,7 +104,7 @@ export async function POST(request) {
             refundStatus: 'pending',
             refundAmount: orderData.totalAmount || orderData.price || 0,
             refundInitiatedAt: now,
-            'timeline.cancelledAt': now,
+            'timeline.cancelled': now,
             'timeline.refundInitiatedAt': now
           });
 

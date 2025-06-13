@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/timeout-checker",
+      "schedule": "*/5 * * * *"
+    }
+  ]
+} 

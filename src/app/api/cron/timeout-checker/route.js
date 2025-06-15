@@ -3,7 +3,7 @@ import { db } from '../../../../firebase/admin';
 import { FieldValue } from 'firebase-admin/firestore';
 
 // Production timeout settings
-const PAYMENT_TIMEOUT_MINUTES = process.env.NODE_ENV === 'production' ? 60 : 5; // 60 min prod, 5 min dev
+const PAYMENT_TIMEOUT_MINUTES = 60; // 1 hour for payment timeout
 const CONFIRMATION_TIMEOUT_HOURS = 3; // Always 3 hours for confirmation
 
 export async function POST(request) {

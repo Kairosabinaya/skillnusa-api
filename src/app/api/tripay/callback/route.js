@@ -1,34 +1,107 @@
 import { NextResponse } from 'next/server';
 import { db } from '../../../../firebase/admin';
 import { FieldValue } from 'firebase-admin/firestore';
+import crypto from 'crypto';
+
+// Tripay allowed IPs for security
+const TRIPAY_ALLOWED_IPS = [
+  '95.111.200.230', // IPv4
+  '2a04:3543:1000:2310:ac92:4cff:fe87:63f9' // IPv6
+];
+
+// Standardized error response format
+const createErrorResponse = (message, code = 'GENERAL_ERROR', status = 400) => {
+  return NextResponse.json({
+    success: false,
+    error: { message, code },
+    timestamp: new Date().toISOString()
+  }, { status });
+};
 
 export async function POST(request) {
   try {
     console.log('🔔 [Tripay Callback] Received callback request');
     
-    // Enhanced request logging
-    const headers = Object.fromEntries(request.headers.entries());
-    console.log('📋 [Tripay Callback] Headers:', headers);
+    // 1. IP Whitelist Validation (Security Enhancement)
+    const clientIP = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 
+                     request.headers.get('x-real-ip') || 
+                     'unknown';
     
-    // Get callback data
-    const callbackData = await request.json();
+    console.log('🔍 [Tripay Callback] Client IP:', clientIP);
+    
+    // Skip IP validation in development mode
+    if (process.env.NODE_ENV === 'production' && !TRIPAY_ALLOWED_IPS.includes(clientIP)) {
+      console.error('❌ [Tripay Callback] Unauthorized IP:', clientIP);
+      return createErrorResponse('Unauthorized IP address', 'IP_NOT_ALLOWED', 403);
+    }
+    
+    // 2. Get headers and validate required headers
+    const headers = Object.fromEntries(request.headers.entries());
+    const callbackSignature = headers['x-callback-signature'];
+    const callbackEvent = headers['x-callback-event'];
+    
+    console.log('📋 [Tripay Callback] Headers:', {
+      'x-callback-signature': callbackSignature ? 'present' : 'missing',
+      'x-callback-event': callbackEvent
+    });
+    
+    if (!callbackSignature) {
+      return createErrorResponse('Missing X-Callback-Signature header', 'MISSING_SIGNATURE');
+    }
+    
+    if (callbackEvent !== 'payment_status') {
+      return createErrorResponse(`Unsupported callback event: ${callbackEvent}`, 'UNSUPPORTED_EVENT');
+    }
+    
+    // 3. Get raw callback data for signature validation
+    const rawBody = await request.text();
+    let callbackData;
+    
+    try {
+      callbackData = JSON.parse(rawBody);
+    } catch (parseError) {
+      console.error('❌ [Tripay Callback] Invalid JSON:', parseError);
+      return createErrorResponse('Invalid JSON format', 'INVALID_JSON');
+    }
+    
     console.log('📥 [Tripay Callback] Data:', callbackData);
     
-    // Validate required fields
+    // 4. Signature Validation (CRITICAL SECURITY FIX)
+    const privateKey = process.env.TRIPAY_PRIVATE_KEY;
+    if (!privateKey) {
+      console.error('❌ [Tripay Callback] Missing TRIPAY_PRIVATE_KEY');
+      return createErrorResponse('Server configuration error', 'CONFIG_ERROR', 500);
+    }
+    
+    const expectedSignature = crypto
+      .createHmac('sha256', privateKey)
+      .update(rawBody)
+      .digest('hex');
+    
+    if (expectedSignature !== callbackSignature) {
+      console.error('❌ [Tripay Callback] Invalid signature:', {
+        expected: expectedSignature,
+        received: callbackSignature
+      });
+      return createErrorResponse('Invalid callback signature', 'INVALID_SIGNATURE', 401);
+    }
+    
+    console.log('✅ [Tripay Callback] Signature validation passed');
+    
+    // 5. Validate required callback fields
     const requiredFields = ['reference', 'merchant_ref', 'status'];
-    for (const field of requiredFields) {
-      if (!callbackData[field]) {
-        console.error(`❌ [Tripay Callback] Missing field: ${field}`);
-        return NextResponse.json(
-          { success: false, message: `Missing required field: ${field}` },
-          { status: 400 }
-        );
-      }
+    const missingFields = requiredFields.filter(field => !callbackData[field]);
+    
+    if (missingFields.length > 0) {
+      return createErrorResponse(
+        `Missing required fields: ${missingFields.join(', ')}`, 
+        'MISSING_FIELDS'
+      );
     }
     
     const { merchant_ref, status, reference, paid_at, amount_received, payment_method } = callbackData;
     
-    console.log('🔍 [Tripay Callback] Processing:', {
+    console.log('🔍 [Tripay Callback] Processing validated callback:', {
       merchant_ref,
       status,
       reference,
@@ -37,53 +110,39 @@ export async function POST(request) {
       payment_method
     });
     
-    // Find order by merchant reference using Firebase Admin SDK
+    // 6. Find order by merchant reference
+    console.log('🔍 [Tripay Callback] Searching for order with merchant_ref:', merchant_ref);
     const ordersRef = db.collection('orders');
     const querySnapshot = await ordersRef.where('merchantRef', '==', merchant_ref).get();
+    
+    console.log('📊 [Tripay Callback] Query results:', {
+      isEmpty: querySnapshot.empty,
+      size: querySnapshot.size,
+      merchant_ref: merchant_ref
+    });
     
     let orderDoc, orderId, orderData;
     
     if (querySnapshot.empty) {
-      console.warn(`⚠️ [Tripay Callback] Order not found for merchant_ref: ${merchant_ref}, creating missing order`);
-      
-      // Auto-create missing order with minimal required data
-      const newOrderData = {
-        merchantRef: merchant_ref,
-        tripayReference: reference,
-        status: 'payment',
-        paymentStatus: 'pending',
-        totalAmount: callbackData.total_amount || 0,
-        amountReceived: callbackData.amount_received || 0,
-        paymentMethod: callbackData.payment_method || 'Unknown',
-        createdAt: FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
-        autoCreated: true,
-        note: 'Auto-created from callback due to missing order'
-      };
-      
-      // Create the missing order
-      const newOrderRef = await ordersRef.add(newOrderData);
-      orderId = newOrderRef.id;
-      orderData = newOrderData;
-      
-      console.log('✅ [Tripay Callback] Created missing order:', {
-        orderId,
-        merchantRef: merchant_ref,
-        totalAmount: callbackData.total_amount
-      });
-    } else {
-      orderDoc = querySnapshot.docs[0];
-      orderId = orderDoc.id;
-      orderData = orderDoc.data();
-      
-      console.log('📋 [Tripay Callback] Found existing order:', {
-        orderId,
-        currentStatus: orderData.status,
-        newStatus: status
-      });
+      console.warn(`⚠️ [Tripay Callback] Order not found for merchant_ref: ${merchant_ref}`);
+      return createErrorResponse(
+        `Order not found for merchant reference: ${merchant_ref}`, 
+        'ORDER_NOT_FOUND', 
+        404
+      );
     }
     
-    // Determine new order status based on Tripay status
+    orderDoc = querySnapshot.docs[0];
+    orderId = orderDoc.id;
+    orderData = orderDoc.data();
+    
+    console.log('📋 [Tripay Callback] Found existing order:', {
+      orderId,
+      currentStatus: orderData.status,
+      newStatus: status
+    });
+    
+    // 7. Determine new order status based on Tripay status
     let newOrderStatus = orderData.status;
     let paymentStatus = 'pending';
     
@@ -105,11 +164,12 @@ export async function POST(request) {
         paymentStatus = 'refunded';
         break;
       default:
+        console.warn(`⚠️ [Tripay Callback] Unknown payment status: ${status}`);
         paymentStatus = 'pending';
         break;
     }
     
-    // Prepare update data using Firebase Admin SDK
+    // 8. Prepare update data
     const updateData = {
       paymentStatus,
       tripayStatus: status,
@@ -117,20 +177,21 @@ export async function POST(request) {
       updatedAt: FieldValue.serverTimestamp()
     };
     
-    // Add payment completion data if paid
+    // 9. Add payment completion data if paid
     if (status.toUpperCase() === 'PAID') {
       updateData.status = newOrderStatus;
       updateData.paidAt = paid_at ? new Date(paid_at * 1000) : FieldValue.serverTimestamp();
       
-      // Set confirmation deadline (1 minute from payment - FOR TESTING)
+      // Set confirmation deadline (3 HOURS - PRODUCTION MODE)
       const confirmationDeadline = new Date();
-      confirmationDeadline.setMinutes(confirmationDeadline.getMinutes() + 1);
+      confirmationDeadline.setHours(confirmationDeadline.getHours() + 3); // 3 hours for production
       updateData.confirmationDeadline = confirmationDeadline;
       
       console.log('⏰ [Tripay Callback] Setting confirmation deadline:', {
         orderId,
         confirmationDeadline: confirmationDeadline.toISOString(),
-        currentTime: new Date().toISOString()
+        currentTime: new Date().toISOString(),
+        hoursFromNow: 3
       });
       
       if (amount_received) {
@@ -141,7 +202,6 @@ export async function POST(request) {
         updateData.paymentMethod = payment_method;
       }
       
-      // Update timeline using nested field update
       updateData['timeline.confirmed'] = FieldValue.serverTimestamp();
       
       console.log('💰 [Tripay Callback] Payment confirmed - updating to pending status');
@@ -149,36 +209,62 @@ export async function POST(request) {
       updateData.status = newOrderStatus;
       updateData.cancelledAt = FieldValue.serverTimestamp();
       updateData.cancellationReason = `Payment ${status.toLowerCase()}`;
-      
-      // Update timeline using nested field update
       updateData['timeline.cancelled'] = FieldValue.serverTimestamp();
       
       console.log(`❌ [Tripay Callback] Payment ${status} - updating to cancelled status`);
     }
     
-    // Update order in Firebase using Admin SDK
-    console.log('🔄 [Tripay Callback] Updating order with data:', updateData);
+    // 10. Update order in Firebase with transaction safety
     const orderRef = db.collection('orders').doc(orderId);
-    await orderRef.update(updateData);
+    
+    // Use transaction for data consistency
+    await db.runTransaction(async (transaction) => {
+      const orderDoc = await transaction.get(orderRef);
+      
+      if (!orderDoc.exists) {
+        throw new Error('Order not found in transaction');
+      }
+      
+      const currentOrderData = orderDoc.data();
+      
+      // Prevent duplicate callback processing
+      if (currentOrderData.tripayReference === reference && 
+          currentOrderData.tripayStatus === status) {
+        console.log('⚠️ [Tripay Callback] Duplicate callback ignored:', {
+          orderId,
+          reference,
+          status
+        });
+        return; // Skip update
+      }
+      
+      transaction.update(orderRef, updateData);
+    });
+    
+    // 11. Verify update
+    const updatedDoc = await orderRef.get();
+    const updatedData = updatedDoc.data();
     
     console.log('✅ [Tripay Callback] Order updated successfully:', {
       orderId,
       merchantRef: merchant_ref,
       oldStatus: orderData.status,
       newStatus: newOrderStatus,
-      paymentStatus
+      paymentStatus,
+      verificationData: {
+        actualStatus: updatedData.status,
+        actualPaymentStatus: updatedData.paymentStatus,
+        actualTripayStatus: updatedData.tripayStatus,
+        updatedAt: updatedData.updatedAt?.toDate?.() || updatedData.updatedAt
+      }
     });
     
-    // Send notification and create chat if payment is confirmed
+    // 12. Send notification and create chat if payment is confirmed
     if (status.toUpperCase() === 'PAID') {
       console.log('📧 [Tripay Callback] Payment confirmed - creating chat and sending notifications');
       
       try {
-        // Import required services
-        const { db: clientDb } = await import('../../../../firebase/config');
-        const { collection, addDoc, serverTimestamp, doc, getDoc } = await import('firebase/firestore');
-        
-        // Get order details for chat creation
+        // Get fresh order data for chat creation
         const orderDoc = await db.collection('orders').doc(orderId).get();
         const orderData = orderDoc.data();
         
@@ -221,7 +307,7 @@ export async function POST(request) {
           console.log('✅ [Tripay Callback] Chat created:', chatRef.id);
           
           // Send order notification message to chat
-          const notificationContent = `🎉 Pesanan Baru Dibuat!\n\n📋 Layanan: ${orderData.title}\n📦 Paket: ${orderData.packageType || 'Dasar'}\n💰 Total: Rp ${(orderData.price || 0).toLocaleString('id-ID')}\n\n📝 Kebutuhan Client:\n"${orderData.requirements || 'Tidak ada kebutuhan khusus'}"\n\n⏰ Pesanan telah dibayar dan menunggu konfirmasi freelancer dalam 1 menit (TESTING).`;
+          const notificationContent = `🎉 Pesanan Baru Dibuat!\n\n📋 Layanan: ${orderData.title}\n📦 Paket: ${orderData.packageType || 'Dasar'}\n💰 Total: Rp ${(orderData.price || 0).toLocaleString('id-ID')}\n\n📝 Kebutuhan Client:\n"${orderData.requirements || 'Tidak ada kebutuhan khusus'}"\n\n⏰ Harap konfirmasi pesanan dalam 3 jam.`;
           
           const messageData = {
             chatId: chatRef.id,
@@ -250,7 +336,7 @@ export async function POST(request) {
             userId: orderData.freelancerId,
             type: 'order',
             title: '🎉 Pesanan Baru Masuk',
-            message: `Pesanan baru "${orderData.title}" telah dibayar dan menunggu konfirmasi Anda.`,
+            message: `Pesanan baru "${orderData.title}" telah dibayar dan menunggu konfirmasi Anda dalam 3 jam.`,
             orderId: orderId,
             createdAt: FieldValue.serverTimestamp(),
             read: false
@@ -264,24 +350,32 @@ export async function POST(request) {
       }
     }
     
+    // 13. Return success response in Tripay expected format
     return NextResponse.json({
       success: true,
       message: 'Callback processed successfully',
-      orderId,
-      merchantRef: merchant_ref,
-      status: newOrderStatus,
-      paymentStatus
+      data: {
+        orderId,
+        merchantRef: merchant_ref,
+        status: newOrderStatus,
+        paymentStatus,
+        processedAt: new Date().toISOString()
+      }
     });
     
   } catch (error) {
-    console.error('❌ [Tripay Callback] Error processing callback:', error);
+    console.error('❌ [Tripay Callback] Critical error processing callback:', error);
     console.error('❌ [Tripay Callback] Error stack:', error.stack);
     
     return NextResponse.json(
       { 
         success: false, 
-        message: 'Callback processing failed',
-        error: error.message 
+        error: {
+          message: 'Callback processing failed',
+          code: 'CALLBACK_ERROR',
+          details: process.env.NODE_ENV === 'development' ? error.message : undefined
+        },
+        timestamp: new Date().toISOString()
       },
       { status: 500 }
     );
@@ -291,7 +385,13 @@ export async function POST(request) {
 // Handle other HTTP methods
 export async function GET() {
   return NextResponse.json(
-    { message: 'Tripay callback endpoint - POST only' },
+    { 
+      success: false,
+      error: {
+        message: 'Tripay callback endpoint - POST only',
+        code: 'METHOD_NOT_ALLOWED'
+      }
+    },
     { status: 405 }
   );
 } 
